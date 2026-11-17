@@ -1,0 +1,22 @@
+{
+  "name": "ai-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Floating always-on-top HUD for Claude Code sessions, token usage and permission prompts",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "install-hooks": "node scripts/install-hooks.js",
+    "uninstall-hooks": "node scripts/install-hooks.js --remove",
+    "status": "node scripts/status.js",
+    "test": "node scripts/selftest.js",
+    "make-icon": "node scripts/make-icon.js",
+    "package": "node scripts/package.js",
+    "install-app": "node scripts/install-app.js",
+    "uninstall-app": "node scripts/install-app.js --remove"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^33.2.1"
+  }
+}
