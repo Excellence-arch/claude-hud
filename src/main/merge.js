@@ -88,6 +88,9 @@ function mergeSessions(registry, snapshot, hookStates, now = Date.now()) {
       turns: t ? t.turns : 0,
       lastTs: t ? t.lastTs : reg.updatedAt,
       hasTranscript: !!t,
+      // Drill-down: the agent map, the live step, and the steps already taken.
+      // A session whose transcript has not been read yet simply has none yet.
+      activity: (t && t.activity) || { events: [], agents: [], current: null, runningAgents: 0 },
     });
   }
 

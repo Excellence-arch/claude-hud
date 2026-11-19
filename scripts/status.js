@@ -50,6 +50,16 @@ function colourState(state) {
   }
 }
 
+/** One timeline step as a line: what it was, and whether it finished. */
+function step(e) {
+  const label = e.kind === 'tool' || e.kind === 'agent' ? (e.tool || 'tool') : e.kind;
+  const text = (e.text || '').slice(0, 64);
+  const mark = e.status === 'running' ? C.blue('.')
+    : e.status === 'error' ? C.red('x')
+      : e.status === 'ok' ? C.green('v') : ' ';
+  return `${mark} ${label}${text ? ` ${C.dim(text)}` : ''}`;
+}
+
 function render(merged, snap, hooksInstalled) {
   const lines = [];
   lines.push('');
@@ -74,6 +84,23 @@ function render(merged, snap, hooksInstalled) {
     ].filter(Boolean).join('  ');
     lines.push(C.dim(`  ${' '.repeat(22)} ${meta}`));
     if (s.stateMessage) lines.push(C.dim(`  ${' '.repeat(22)} ${s.stateMessage}`));
+
+    // The same drill-down the HUD opens on a click: the live step, then any
+    // subagents, then the steps already taken.
+    const act = s.activity || {};
+    const pad = ' '.repeat(22);
+    if (act.current) {
+      lines.push(`  ${pad} ${C.dim('now')} ${step(act.current)}`);
+    }
+    for (const a of (act.agents || [])) {
+      if (a.kind !== 'subagent') continue;
+      const mark = a.state === 'running' ? C.blue('>') : (a.state === 'error' ? C.red('x') : C.green('v'));
+      const doing = a.current ? step(a.current) : C.dim('idle');
+      lines.push(`  ${pad} ${mark} ${a.type || 'agent'}: ${a.label}  ${doing}`);
+    }
+    for (const e of (act.events || []).slice(0, 5)) {
+      lines.push(C.dim(`  ${pad}   ${step(e)}`));
+    }
   }
 
   const budget = DEFAULT_WINDOW_BUDGET;

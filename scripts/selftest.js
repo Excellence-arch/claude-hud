@@ -13,6 +13,7 @@ const path = require('path');
 const { SessionWatcher } = require('../src/main/watcher');
 const { mergeSessions } = require('../src/main/merge');
 const { EventBridge, STATES } = require('../src/main/events');
+const { SessionActivity, MAX_EVENTS } = require('../src/main/activity');
 
 let failures = 0;
 
@@ -165,6 +166,112 @@ function mergeTests() {
   check('registry name is used as the label', out.sessions[0].label, 'ai-helper-43');
 }
 
+/**
+ * The drill-down: steps are recorded in order, tool calls are closed out by
+ * their result, and subagent work is attributed to the agent that is doing it.
+ */
+function activityTests() {
+  console.log('');
+  const a = new SessionActivity();
+  const t = Date.now();
+
+  const line = (over) => Object.assign({ sessionId: 's1', isSidechain: false }, over);
+
+  a.record(line({
+    type: 'user', uuid: 'u1', parentUuid: null,
+    message: { content: [{ type: 'text', text: 'please refactor the watcher' }] },
+  }), t);
+
+  a.record(line({
+    type: 'assistant', uuid: 'a1', parentUuid: 'u1',
+    message: { content: [{ type: 'tool_use', id: 'tool_1', name: 'Read', input: { file_path: 'c:\\work\\demo\\watcher.js' } }] },
+  }), t + 100);
+
+  let v = a.view();
+  check('a tool call becomes the live step', v.current.tool, 'Read');
+  check('tool input is summarised, not dumped', v.current.text, 'watcher.js');
+  check('an unfinished tool call reads as running', v.current.status, 'running');
+
+  // The result arrives as a tool_result on a user line.
+  a.record(line({
+    type: 'user', uuid: 'u2', parentUuid: 'a1',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'tool_1', content: 'ok' }] },
+  }), t + 900);
+
+  v = a.view();
+  check('a finished tool call is marked done', v.events[0].status, 'ok');
+  check('the timeline is newest first', v.events[0].tool, 'Read');
+  check('the prompt is still in the history', v.events[v.events.length - 1].kind, 'prompt');
+
+  // A Task call opens a subagent in the agent map.
+  a.record(line({
+    type: 'assistant', uuid: 'a2', parentUuid: 'u2',
+    message: {
+      content: [{
+        type: 'tool_use', id: 'task_1', name: 'Task',
+        input: { subagent_type: 'Explore', description: 'find the callers', prompt: 'Locate every caller of ingest()' },
+      }],
+    },
+  }), t + 1000);
+
+  v = a.view();
+  check('a Task call adds an agent', v.agents.length, 2);
+  check('the subagent is running', v.runningAgents, 1);
+  check('the main thread sorts first', v.agents[0].kind, 'main');
+  check('the subagent carries its type', v.agents[1].type, 'Explore');
+
+  // Sidechain lines belong to that subagent, matched on its opening prompt.
+  a.record(line({
+    type: 'user', uuid: 's-root', parentUuid: null, isSidechain: true,
+    message: { content: [{ type: 'text', text: 'Locate every caller of ingest()' }] },
+  }), t + 1100);
+  a.record(line({
+    type: 'assistant', uuid: 's-1', parentUuid: 's-root', isSidechain: true,
+    message: { content: [{ type: 'tool_use', id: 'tool_2', name: 'Grep', input: { pattern: 'ingest' } }] },
+  }), t + 1200);
+
+  v = a.view();
+  const sub = v.agents.find(x => x.kind === 'subagent');
+  check('subagent work is attributed to the subagent', sub.current.tool, 'Grep');
+  check('the subagent step is tagged with its agent', v.events[0].agentId, 'task_1');
+  check('the main thread is not credited with it', v.agents[0].current.kind, 'agent');
+
+  // Billing follows the same attribution.
+  a.bill(line({ isSidechain: true, uuid: 's-2', parentUuid: 's-1' }), 500);
+  a.bill(line({ isSidechain: false, uuid: 'a3', parentUuid: 'u2' }), 20);
+  v = a.view();
+  check('subagent tokens are counted against the subagent',
+    v.agents.find(x => x.kind === 'subagent').tokens, 500);
+  check('main-thread tokens stay on the main thread', v.agents[0].tokens, 20);
+
+  // The Task result closes the agent out.
+  a.record(line({
+    type: 'user', uuid: 'u3', parentUuid: 'a2',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'task_1', content: 'done' }] },
+  }), t + 5000);
+  v = a.view();
+  check('a returned Task marks its agent done',
+    v.agents.find(x => x.kind === 'subagent').state, 'done');
+  check('no agents are left running', v.runningAgents, 0);
+
+  // A line the watcher re-reads must not double up.
+  const before = a.view().events.length;
+  a.record(line({
+    type: 'assistant', uuid: 'a1', parentUuid: 'u1',
+    message: { content: [{ type: 'tool_use', id: 'tool_1', name: 'Read', input: { file_path: 'watcher.js' } }] },
+  }), t + 100);
+  check('a re-read line is ignored', a.view().events.length, before);
+
+  // The timeline must stay bounded on a long session.
+  for (let i = 0; i < 200; i++) {
+    a.record(line({
+      type: 'assistant', uuid: `bulk-${i}`, parentUuid: 'u1',
+      message: { content: [{ type: 'text', text: `step ${i}` }] },
+    }), t + 6000 + i);
+  }
+  check('the timeline is capped', a.events.length, MAX_EVENTS);
+}
+
 /** Startup replay: an already-pending prompt must not be missed. */
 function replayTest() {
   console.log('');
@@ -188,6 +295,7 @@ function replayTest() {
 function run() {
   main();
   mergeTests();
+  activityTests();
   replayTest();
   console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`);
   process.exit(failures === 0 ? 0 : 1);

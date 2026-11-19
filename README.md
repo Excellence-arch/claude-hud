@@ -10,6 +10,11 @@ It shows:
   branch, and a live state: *working*, *your turn*, or *needs you*
 - **Context fill** — a progress bar per session, so you can see a session heading
   for auto-compaction before it gets there
+- **What it is doing** — the live step on each working row (*Bash · run the
+  tests*), and, on a click, a drop-down with that session's **agent map** —
+  the main thread plus every subagent it has launched, each with its own live
+  step — and the **activity so far**: prompts, tool calls and replies, newest
+  first, with each call marked running, done or failed
 - **Rolling 5-hour token usage** — a ring gauge in the header (visible even when
   collapsed) plus a sparkline showing *when* the budget went
 - **Permission prompts** — the window highlights and flashes the moment a session
@@ -75,7 +80,8 @@ activity and cannot tell you about permission prompts.
 | Move it | Drag anywhere on the card |
 | Collapse / expand | Click the chevron, or double-click the title bar |
 | Hide it | Click ✕ — the tray icon brings it back |
-| Jump to a session | Click a session row or an alert — focuses VS Code on that project (`code -r`), falling back to the folder if the `code` CLI is missing |
+| See what a session is doing | Click the ⌄ button on its row (or anywhere on the row) — it drops down the agent map and the activity so far; click again to close. Scroll position is kept as the panel refreshes |
+| Jump to a session | Click ↗ on the row, or click an alert — focuses VS Code on that project (`code -r`), falling back to the folder if the `code` CLI is missing |
 | Reset position | Right-click the tray icon → Reset position |
 | Quit | Right-click the tray icon → Quit |
 
@@ -116,6 +122,15 @@ Two details matter for correctness:
   deduplicated by `requestId`, or the totals come out 2–3× too high.
 - Subagent (`isSidechain`) responses have their own context, so they are counted
   toward spend but never used for the main session's context bar.
+
+The same lines also carry what the session is *doing*: every `tool_use` block
+and the `tool_result` that closes it, every reply, and every `Task` call, which
+is what opens a subagent in the agent map. Subagent lines name no agent, so they
+are chained by `parentUuid` back to the sidechain's opening prompt and matched
+to the `Task` call that supplied it — which is how a subagent's steps and tokens
+end up against the subagent rather than the main thread. Both the timeline and
+the agent map are capped per session, so a long-running session cannot grow
+without bound.
 
 **Hooks** tell the HUD what a session is doing *right now*, which a transcript
 cannot show. `hooks/claude-hook.js` appends one line to
@@ -185,6 +200,7 @@ src/main/sessions.js   Claude Code's live session registry (what is open now)
 src/main/watcher.js    Transcript tailing, context + usage math
 src/main/events.js     Hook event log tailing, per-session state machine
 src/main/merge.js      Reconciles all three (Electron-free, so testable)
+src/main/activity.js   Per-session agent map and step timeline (Electron-free)
 src/main/preload.js    The renderer's entire API surface
 src/renderer/          The window itself (plain HTML/CSS/JS, no framework)
 hooks/claude-hook.js   What Claude Code invokes

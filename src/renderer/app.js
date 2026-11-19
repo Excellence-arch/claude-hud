@@ -28,6 +28,15 @@ const COLLAPSED_HEIGHT = 52;
 let collapsed = false;
 let lastPayload = null;
 
+// Sessions whose drill-down is open. Kept here rather than in the DOM, because
+// the session list is rebuilt from scratch on every push.
+const expanded = new Set();
+
+// So is scroll position: the watcher pushes every couple of seconds, and a
+// rebuilt list would otherwise jump back to the top under the reader.
+let listScroll = 0;
+const stepScroll = new Map(); // sessionId -> scrollTop of its timeline
+
 // ---- formatting -----------------------------------------------------------
 
 function tokens(n) {
@@ -58,6 +67,27 @@ const STATE_LABEL = {
   idle: 'waiting',
 };
 
+/** What each timeline entry is, in a word, for the chip at its left. */
+const KIND_LABEL = {
+  prompt: 'you',
+  say: 'reply',
+  agent: 'agent',
+  brief: 'brief',
+  tool: null, // the tool names itself
+};
+
+/** Verb for the live step, so the "now" line reads as a sentence. */
+function stepPhrase(step) {
+  if (!step) return null;
+  if (step.kind === 'tool') {
+    return step.text ? `${step.tool} · ${step.text}` : step.tool;
+  }
+  if (step.kind === 'agent') return `delegated · ${step.text}`;
+  if (step.kind === 'prompt') return `your prompt · ${step.text}`;
+  if (step.kind === 'brief') return step.text;
+  return step.text;
+}
+
 function level(pct) {
   if (pct >= 0.9) return 'hot';
   if (pct >= 0.7) return 'warn';
@@ -66,6 +96,27 @@ function level(pct) {
 
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** A chevron, matching the one on the title bar. CSS rotates it when closed. */
+function chevron(parent) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 10 6');
+  svg.setAttribute('width', '9');
+  svg.setAttribute('height', '6');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS(SVG_NS, 'path');
+  path.setAttribute('d', 'M1 1l4 4 4-4');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.6');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  svg.append(path);
+  parent.append(svg);
+  return svg;
 }
 
 function add(parent, tag, className, text) {
@@ -150,19 +201,49 @@ function renderSessions(p) {
     return;
   }
 
+  // A session that has closed must not keep its drill-down open forever.
+  const live = new Set(p.sessions.map(s => s.sessionId));
+  for (const id of expanded) if (!live.has(id)) expanded.delete(id);
+  for (const id of stepScroll.keys()) if (!live.has(id)) stepScroll.delete(id);
+
+  const toggle = (id) => {
+    if (expanded.has(id)) expanded.delete(id);
+    else expanded.add(id);
+    if (lastPayload) render(lastPayload);
+  };
+
   for (const s of p.sessions) {
-    const row = add(el.sessions, 'div', `row ${s.state}`);
+    const open = expanded.has(s.sessionId);
+    const row = add(el.sessions, 'div', `row ${s.state}${open ? ' open' : ''}`);
     row.title = `${s.cwd || ''}\n${s.model || 'starting up'} · ${s.turns} turns`
       + ` · ${tokens(s.billedTokens)} tokens billed · pid ${s.pid}`
-      + `\nClick to open in VS Code`;
-    row.addEventListener('click', () => window.hud.open(s.cwd));
+      + `\nClick for the agent map and activity`;
 
     const top = add(row, 'div', 'row-top');
+
+    // An explicit button, so it is obvious a row has more behind it. The whole
+    // row stays clickable too, since that is the bigger target.
+    const caret = add(top, 'button', 'row-toggle no-drag');
+    chevron(caret);
+    caret.title = open ? 'Hide the agent map' : 'Show the agent map and activity';
+    caret.setAttribute('aria-expanded', open ? 'true' : 'false');
+    caret.setAttribute('aria-label', caret.title);
+    caret.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggle(s.sessionId);
+    });
+
     add(top, 'span', 'row-name', s.label);
 
     const model = modelShort(s.model);
     if (model) add(top, 'span', 'chip', model);
     if (s.branch) add(top, 'span', 'chip branch', s.branch);
+
+    const running = s.activity ? s.activity.runningAgents : 0;
+    if (running > 0) {
+      const chip = add(top, 'span', 'chip agents', `${running} agent${running === 1 ? '' : 's'}`);
+      chip.title = `${running} subagent${running === 1 ? '' : 's'} running`;
+    }
 
     const state = add(top, 'span', `row-state ${s.state}`);
     if (s.state === 'working') {
@@ -172,6 +253,15 @@ function renderSessions(p) {
     } else {
       state.textContent = `${STATE_LABEL[s.state] || s.state} · ${ago(p.now - s.stateTs)}`;
     }
+
+    // Opening the editor moved onto its own button once the row itself became
+    // the control for the drill-down.
+    const go = add(top, 'button', 'row-open no-drag', '↗');
+    go.title = 'Open this project in VS Code';
+    go.addEventListener('click', (e) => {
+      e.stopPropagation();
+      window.hud.open(s.cwd);
+    });
 
     const barRow = add(row, 'div', 'row-bar');
     const track = add(barRow, 'div', 'track');
@@ -184,7 +274,102 @@ function renderSessions(p) {
     const ceiling = `${s.limitInferred ? '~' : ''}${tokens(s.contextLimit)}`;
     add(barRow, 'span', `row-pct ${hot ? 'hot' : ''}`.trim(),
       s.contextPct >= 0.99 ? 'context full' : `${tokens(s.contextTokens)} / ${ceiling}`);
+
+    renderNow(row, s, open);
+    if (open) renderDetail(row, s, p.now);
+
+    row.addEventListener('click', () => toggle(s.sessionId));
   }
+
+  // The list was rebuilt from nothing, so put the reader back where they were.
+  el.sessions.scrollTop = listScroll;
+}
+
+/**
+ * The live step, on the row itself. It is what makes the closed row answer
+ * "doing what?" without a click. Once the row is open the agent map says the
+ * same thing in more detail, so this line stands down.
+ */
+function renderNow(row, s, open) {
+  const step = s.activity && s.activity.current;
+  if (!step || open) return;
+  if (s.state !== 'working') return;
+
+  const line = add(row, 'div', 'row-now');
+  const live = step.status === 'running';
+  add(line, 'span', `now-dot ${live ? 'live' : (step.status || '')}`.trim());
+  add(line, 'span', 'now-text', stepPhrase(step) || '');
+}
+
+/** The drop-down: who is working on what, and the steps taken so far. */
+function renderDetail(row, s, now) {
+  const detail = add(row, 'div', 'detail no-drag');
+  // Clicks inside the panel must not collapse the row out from under them.
+  detail.addEventListener('click', e => e.stopPropagation());
+
+  const agents = (s.activity && s.activity.agents) || [];
+  const events = (s.activity && s.activity.events) || [];
+
+  add(detail, 'div', 'detail-head', 'Agents');
+  const map = add(detail, 'div', 'agent-map');
+  if (agents.length === 0) {
+    add(map, 'div', 'detail-empty', 'No activity read from the transcript yet.');
+  }
+  for (const a of agents) {
+    const item = add(map, 'div', `agent ${a.state}`);
+
+    const head = add(item, 'div', 'agent-head');
+    add(head, 'span', `agent-dot ${a.state}`);
+    add(head, 'span', 'agent-name', a.kind === 'main' ? 'main thread' : a.label);
+    if (a.kind !== 'main' && a.type) add(head, 'span', 'chip agent-type', a.type);
+
+    const meta = add(head, 'span', 'agent-meta');
+    const bits = [];
+    if (a.turns) bits.push(`${a.turns} turn${a.turns === 1 ? '' : 's'}`);
+    if (a.tokens) bits.push(tokens(a.tokens));
+    if (a.state === 'running' && a.lastTs) bits.push(ago(now - a.lastTs));
+    else if (a.endTs) bits.push(`done ${ago(now - a.endTs)} ago`);
+    meta.textContent = bits.join(' · ');
+
+    const doing = add(item, 'div', 'agent-doing');
+    if (a.state === 'running') {
+      doing.textContent = a.current ? stepPhrase(a.current) : 'waiting for its next step';
+    } else {
+      doing.textContent = a.state === 'error' ? 'finished with an error' : 'finished';
+      doing.classList.add('muted');
+    }
+  }
+
+  add(detail, 'div', 'detail-head', 'Activity');
+  const list = add(detail, 'div', 'steps');
+  list.addEventListener('scroll', () => stepScroll.set(s.sessionId, list.scrollTop));
+  if (events.length === 0) {
+    add(list, 'div', 'detail-empty', 'Nothing recorded yet.');
+  }
+
+  // Subagent steps are tagged, so a mixed timeline stays readable.
+  const byId = new Map(agents.map(a => [a.id, a]));
+
+  for (const e of events) {
+    const item = add(list, 'div', `step ${e.kind}`);
+    add(item, 'span', `step-dot ${e.status === 'running' ? 'live' : (e.status || e.kind)}`);
+
+    const label = e.kind === 'tool' ? e.tool : (KIND_LABEL[e.kind] || e.kind);
+    add(item, 'span', `step-tag ${e.kind}`, label);
+    add(item, 'span', 'step-text', e.text || '');
+
+    const owner = byId.get(e.agentId);
+    if (owner && owner.kind === 'subagent') {
+      add(item, 'span', 'step-agent', owner.type || 'agent');
+    }
+
+    add(item, 'span', 'step-time mono', ago(now - e.ts));
+  }
+
+  // Same reason as the session list: this panel is rebuilt on every push, and
+  // scrolling back through a history must survive that.
+  const kept = stepScroll.get(s.sessionId);
+  if (kept) list.scrollTop = kept;
 }
 
 function renderUsage(p) {
@@ -215,6 +400,19 @@ function renderFooter(p) {
   el.footer.textContent = 'Permission alerts are off — run: npm run install-hooks';
 }
 
+/**
+ * The window grows to fit its content, so without a ceiling an expanded row on
+ * a short screen would push the card off the display. The main process says how
+ * tall the window may get; the session list absorbs the difference by scrolling.
+ */
+function applyHeightCap(p) {
+  const cap = Number(p.maxHeight);
+  if (!Number.isFinite(cap) || cap <= 0) return;
+  // Header, alerts, the usage block and padding live outside the list.
+  const chrome = 150 + el.alerts.getBoundingClientRect().height;
+  el.sessions.style.maxHeight = `${Math.max(140, Math.round(cap - chrome))}px`;
+}
+
 function render(p) {
   lastPayload = p;
   renderStatus(p);
@@ -222,6 +420,7 @@ function render(p) {
   if (!collapsed) {
     renderAlerts(p);
     renderSessions(p);
+    applyHeightCap(p);
     renderUsage(p);
     renderFooter(p);
   }
@@ -249,6 +448,9 @@ function setCollapsed(v) {
 }
 
 // ---- wiring --------------------------------------------------------------
+
+// Remembered so the next push can restore it; the list is rebuilt each time.
+el.sessions.addEventListener('scroll', () => { listScroll = el.sessions.scrollTop; });
 
 el.toggle.addEventListener('click', () => setCollapsed(!collapsed));
 el.close.addEventListener('click', () => window.hud.hide());

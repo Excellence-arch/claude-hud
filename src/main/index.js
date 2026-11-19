@@ -82,6 +82,7 @@ function mergePayload() {
       buckets: latestSnapshot.window.buckets || [],
     },
     hooksInstalled: bridge ? bridge.isInstalled() : false,
+    maxHeight: maxWindowHeight(),
     collapsed: uiState.collapsed,
   };
 }
@@ -186,6 +187,25 @@ function defaultPosition() {
   };
 }
 
+/**
+ * Tallest the window may grow on the display it is currently on. An expanded
+ * session drill-down can ask for a lot of height; past this the renderer
+ * scrolls its session list instead of running off the screen.
+ */
+function maxWindowHeight() {
+  let point = { x: 0, y: 0 };
+  if (win && !win.isDestroyed()) {
+    const [x, y] = win.getPosition();
+    point = { x, y };
+  }
+  try {
+    const area = screen.getDisplayNearestPoint(point).workArea;
+    return Math.max(240, area.height - EDGE_MARGIN * 2);
+  } catch {
+    return 900;
+  }
+}
+
 /** Keep the window on a display that actually exists (monitors get unplugged). */
 function clampToDisplay(x, y) {
   const nearest = screen.getDisplayNearestPoint({ x, y }).workArea;
@@ -286,7 +306,7 @@ function registerIpc() {
   // The renderer measures its own content and asks for a matching window.
   ipcMain.on('hud:height', (_e, height) => {
     if (!win || win.isDestroyed()) return;
-    const h = Math.max(COLLAPSED_HEIGHT, Math.min(900, Math.round(height)));
+    const h = Math.max(COLLAPSED_HEIGHT, Math.min(maxWindowHeight(), Math.round(height)));
     // The renderer re-measures on every tick; resizing only on an actual change
     // avoids pointless window churn while hovering or dragging.
     if (h === lastHeight) return;

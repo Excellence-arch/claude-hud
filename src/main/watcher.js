@@ -13,6 +13,7 @@ const path = require('path');
 const { EventEmitter } = require('events');
 
 const { PROJECTS_DIR } = require('./paths');
+const { SessionActivity } = require('./activity');
 const {
   ACTIVE_WINDOW_MS, BUSY_WINDOW_MS, USAGE_WINDOW_MS,
   INITIAL_TAIL_BYTES, POLL_MS, contextLimitFor, DEFAULT_CONTEXT_LIMIT,
@@ -216,6 +217,8 @@ class SessionWatcher extends EventEmitter {
         contextPeak: 0,
         billedTokens: 0,
         turns: 0,
+        // What the session is doing and has done, step by step.
+        activity: new SessionActivity(),
       };
       this.sessions.set(sessionId, s);
     }
@@ -227,6 +230,10 @@ class SessionWatcher extends EventEmitter {
     }
     if (entry.cwd) s.cwd = entry.cwd;
     if (entry.gitBranch) s.branch = entry.gitBranch;
+
+    // Prompts, tool calls, replies and subagent launches, for the drill-down.
+    // Done before the usage gate below, which drops user entries entirely.
+    s.activity.record(entry, ts || Date.now());
 
     const msg = entry.message;
     if (entry.type !== 'assistant' || !msg || !msg.usage) return;
@@ -251,6 +258,8 @@ class SessionWatcher extends EventEmitter {
 
     s.billedTokens += billed;
     s.turns += 1;
+    // Split the same figure per agent, so a subagent's cost is visible too.
+    s.activity.bill(entry, billed);
 
     // A subagent runs its own context and must not overwrite the main thread.
     if (!entry.isSidechain && context > 0) {
@@ -287,6 +296,7 @@ class SessionWatcher extends EventEmitter {
         billedTokens: s.billedTokens,
         turns: s.turns,
         file: s.file,
+        activity: s.activity.view(),
       });
     }
     sessions.sort((a, b) => b.lastTs - a.lastTs);
